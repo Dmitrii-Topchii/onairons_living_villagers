@@ -15,7 +15,7 @@ import java.util.concurrent.CompletableFuture;
 
 public class VillagerAiClient {
 	private static final URI RESPOND_URI = URI.create("http://127.0.0.1:8000/villager/respond");
-	private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(5L);
+	private static final Duration REQUEST_TIMEOUT = Duration.ofSeconds(30L);
 
 	private final HttpClient httpClient = HttpClient.newBuilder()
 			.connectTimeout(Duration.ofSeconds(2L))
@@ -48,6 +48,9 @@ public class VillagerAiClient {
 		root.addProperty("packet_count", request.packetCount());
 		root.addProperty("opus_byte_count", request.opusByteCount());
 		root.addProperty("whispering", request.whispering());
+		root.addProperty("audio_sample_rate_hz", request.audioSampleRateHz());
+		root.addProperty("audio_channels", request.audioChannels());
+		root.addProperty("audio_pcm_s16le_base64", request.pcmAudioBase64());
 
 		var player = new JsonObject();
 		player.addProperty("uuid", request.playerUuid().toString());
@@ -103,7 +106,10 @@ public class VillagerAiClient {
 			int packetCount,
 			int opusByteCount,
 			long durationMs,
-			boolean whispering
+			boolean whispering,
+			int audioSampleRateHz,
+			int audioChannels,
+			String pcmAudioBase64
 	) {
 	}
 

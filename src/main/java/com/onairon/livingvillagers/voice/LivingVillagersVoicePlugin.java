@@ -3,9 +3,13 @@ package com.onairon.livingvillagers.voice;
 import com.onairon.livingvillagers.OnaironsLivingVillagers;
 import com.onairon.livingvillagers.ai.VillagerAiClient;
 import de.maxhenkel.voicechat.api.VoicechatPlugin;
+import de.maxhenkel.voicechat.api.VoicechatServerApi;
 import de.maxhenkel.voicechat.api.events.EventRegistration;
 import de.maxhenkel.voicechat.api.events.MicrophonePacketEvent;
 import de.maxhenkel.voicechat.api.events.VoicechatServerStartedEvent;
+import de.maxhenkel.voicechat.api.opus.OpusDecoder;
+import de.maxhenkel.voicechat.api.opus.OpusEncoderMode;
+import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.core.BlockPos;
 import net.minecraft.network.chat.Component;
 import net.minecraft.server.level.ServerPlayer;
@@ -17,8 +21,12 @@ import net.minecraft.world.level.block.Blocks;
 import net.minecraft.world.level.entity.EntityTypeTest;
 import net.minecraft.world.phys.AABB;
 
+import java.io.ByteArrayOutputStream;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
+import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
@@ -29,8 +37,12 @@ public class LivingVillagersVoicePlugin implements VoicechatPlugin {
 	private static final int MIN_SPEECH_OPUS_BYTES = 2500;
 	private static final double VILLAGER_HEARING_RADIUS_BLOCKS = 8.0D;
 	private static final int CONTEXT_SCAN_RADIUS_BLOCKS = 4;
+	private static final int VOICECHAT_SAMPLE_RATE_HZ = 48_000;
+	private static final int VOICECHAT_CHANNELS = 1;
+	private static final float VILLAGER_VOICE_DISTANCE_BLOCKS = 16.0F;
 	private final Map<UUID, SpeechSegmentBuffer> speechBuffers = new ConcurrentHashMap<>();
 	private final VillagerAiClient aiClient = new VillagerAiClient();
+	private volatile VoicechatServerApi voicechatApi;
 
 	@Override
 	public String getPluginId() {
@@ -44,6 +56,7 @@ public class LivingVillagersVoicePlugin implements VoicechatPlugin {
 	}
 
 	private void onVoicechatServerStarted(VoicechatServerStartedEvent event) {
+		voicechatApi = event.getVoicechat();
 		OnaironsLivingVillagers.LOGGER.info("Living Villagers voice plugin connected to Simple Voice Chat");
 	}
 
@@ -70,7 +83,7 @@ public class LivingVillagersVoicePlugin implements VoicechatPlugin {
 			finishSpeechSegment(player, buffer, "silence gap");
 		}
 
-		buffer.addPacket(opusData.length, packet.isWhispering(), now);
+		buffer.addPacket(opusData, packet.isWhispering(), now, voicechatApi);
 	}
 
 	private void finishSpeechSegment(de.maxhenkel.voicechat.api.ServerPlayer voicePlayer, SpeechSegmentBuffer buffer, String reason) {
@@ -129,13 +142,15 @@ public class LivingVillagersVoicePlugin implements VoicechatPlugin {
 
 		var distance = Math.sqrt(nearestVillager.distanceToSqr(minecraftPlayer));
 		var profession = getVillagerProfession(nearestVillager);
+		var dimension = minecraftPlayer.level().dimension().identifier().toString();
+		var dayTime = minecraftPlayer.level().getDayTime() % 24000L;
 		var scene = new ArrayList<String>();
 		scene.add("Player spoke through Simple Voice Chat.");
-		scene.add("Speech-to-text is not connected yet, so transcript is still mocked.");
+		scene.add("Speech audio is attached for optional speech-to-text on the AI server.");
 		scene.add(String.format("Nearest villager is %.1f blocks away.", distance));
 		scene.add("Nearest villager profession is " + profession + ".");
-		scene.add("Current dimension is " + minecraftPlayer.level().dimension() + ".");
-		scene.add("World time is " + minecraftPlayer.level().getDayTime() % 24000L + " ticks.");
+		scene.add("Current dimension is " + dimension + ".");
+		scene.add("World time is " + dayTime + " ticks (" + describeTimeOfDay(dayTime) + ").");
 		scene.addAll(scanVillagerSurroundings(nearestVillager));
 
 		OnaironsLivingVillagers.LOGGER.info("Sending villager scene context: {}", scene);
@@ -153,7 +168,10 @@ public class LivingVillagersVoicePlugin implements VoicechatPlugin {
 						segment.packetCount(),
 						segment.opusByteCount(),
 						segment.durationMs(),
-						segment.whispering()
+						segment.whispering(),
+						VOICECHAT_SAMPLE_RATE_HZ,
+						VOICECHAT_CHANNELS,
+						segment.pcmAudioBase64()
 				))
 				.thenAccept(response -> {
 					OnaironsLivingVillagers.LOGGER.info(
@@ -165,7 +183,18 @@ public class LivingVillagersVoicePlugin implements VoicechatPlugin {
 
 					var server = minecraftPlayer.level().getServer();
 					if (server != null) {
-						server.execute(() -> sendPlayerMessage(minecraftPlayer, "Villager: " + response.line()));
+						server.execute(() -> {
+							if (!nearestVillager.isAlive()) {
+								OnaironsLivingVillagers.LOGGER.info(
+										"Skipping villager response because target villager {} is no longer alive",
+										nearestVillager.getUUID()
+								);
+								return;
+							}
+
+							sendPlayerMessage(minecraftPlayer, "Villager: " + response.line());
+							playVillagerVoice(nearestVillager, response.line());
+						});
 					}
 				})
 				.exceptionally(error -> {
@@ -187,8 +216,22 @@ public class LivingVillagersVoicePlugin implements VoicechatPlugin {
 		return villager.getVillagerData()
 				.profession()
 				.unwrapKey()
-				.map(Object::toString)
+				.map(key -> key.identifier().getPath())
+				.map(path -> path.equals("none") ? "unemployed" : path.replace('_', ' '))
 				.orElse("unknown");
+	}
+
+	private String describeTimeOfDay(long dayTime) {
+		if (dayTime >= 23000L || dayTime < 1000L) {
+			return "sunrise";
+		}
+		if (dayTime < 12000L) {
+			return "day";
+		}
+		if (dayTime < 13000L) {
+			return "sunset";
+		}
+		return "night";
 	}
 
 	private ArrayList<String> scanVillagerSurroundings(Villager villager) {
@@ -268,7 +311,7 @@ public class LivingVillagersVoicePlugin implements VoicechatPlugin {
 			scene.add("There are " + droppedItems + " dropped item(s) near the villager.");
 		}
 		if (monsters > 0) {
-			scene.add("There are " + monsters + " hostile mob(s) near the villager.");
+			scene.add("Danger: hostile mobs nearby: " + summarizeEntityTypes(nearbyEntities, Monster.class) + ".");
 		}
 		if (otherVillagers > 0) {
 			scene.add("There are " + otherVillagers + " other villager(s) nearby.");
@@ -277,8 +320,51 @@ public class LivingVillagersVoicePlugin implements VoicechatPlugin {
 		return scene;
 	}
 
+	private String summarizeEntityTypes(List<Entity> entities, Class<?> type) {
+		var counts = new HashMap<String, Integer>();
+		for (var entity : entities) {
+			if (!type.isInstance(entity)) {
+				continue;
+			}
+
+			var key = BuiltInRegistries.ENTITY_TYPE.getKey(entity.getType());
+			var name = key == null ? entity.getType().toShortString() : key.getPath().replace('_', ' ');
+			counts.merge(name, 1, Integer::sum);
+		}
+
+		var summary = new ArrayList<String>();
+		for (var entry : counts.entrySet()) {
+			summary.add(entry.getValue() + " " + entry.getKey());
+		}
+		summary.sort(String::compareTo);
+		return String.join(", ", summary);
+	}
+
 	private void sendPlayerMessage(ServerPlayer minecraftPlayer, String message) {
 		minecraftPlayer.sendSystemMessage(Component.literal(message));
+	}
+
+	private void playVillagerVoice(Villager villager, String line) {
+		var api = voicechatApi;
+		if (api == null || !villager.isAlive()) {
+			return;
+		}
+
+		var channel = api.createEntityAudioChannel(UUID.randomUUID(), api.fromEntity(villager));
+		if (channel == null) {
+			OnaironsLivingVillagers.LOGGER.warn("Could not create villager voice audio channel");
+			return;
+		}
+
+		channel.setDistance(VILLAGER_VOICE_DISTANCE_BLOCKS);
+		var encoder = api.createEncoder(OpusEncoderMode.VOIP);
+		var audio = VillagerMumbleSynthesizer.synthesize(line);
+		var audioPlayer = api.createAudioPlayer(channel, encoder, audio);
+		audioPlayer.setOnStopped(() -> {
+			channel.flush();
+			encoder.close();
+		});
+		audioPlayer.startPlaying();
 	}
 
 	private static class SpeechSegmentBuffer {
@@ -287,17 +373,20 @@ public class LivingVillagersVoicePlugin implements VoicechatPlugin {
 		private boolean whispering;
 		private long startedAtMs;
 		private long lastPacketAtMs;
+		private OpusDecoder decoder;
+		private ByteArrayOutputStream pcmAudio = new ByteArrayOutputStream();
 
-		synchronized void addPacket(int opusBytes, boolean whispering, long nowMs) {
+		synchronized void addPacket(byte[] opusData, boolean whispering, long nowMs, VoicechatServerApi api) {
 			if (packetCount == 0) {
 				startedAtMs = nowMs;
 				this.whispering = whispering;
 			}
 
 			packetCount++;
-			opusByteCount += opusBytes;
+			opusByteCount += opusData.length;
 			lastPacketAtMs = nowMs;
 			this.whispering = this.whispering || whispering;
+			decodePcm(opusData, api);
 		}
 
 		synchronized boolean hasAudio() {
@@ -309,23 +398,59 @@ public class LivingVillagersVoicePlugin implements VoicechatPlugin {
 		}
 
 		synchronized SpeechSegment finish() {
+			var pcmBase64 = Base64.getEncoder().encodeToString(pcmAudio.toByteArray());
 			var segment = new SpeechSegment(
 					packetCount,
 					opusByteCount,
 					packetCount <= 0 ? 0L : Math.max(1L, lastPacketAtMs - startedAtMs),
-					whispering
+					whispering,
+					pcmBase64
 			);
 
+			if (decoder != null) {
+				decoder.close();
+			}
 			packetCount = 0;
 			opusByteCount = 0;
 			whispering = false;
 			startedAtMs = 0L;
 			lastPacketAtMs = 0L;
+			decoder = null;
+			pcmAudio = new ByteArrayOutputStream();
 
 			return segment;
 		}
+
+		private void decodePcm(byte[] opusData, VoicechatServerApi api) {
+			if (api == null) {
+				return;
+			}
+
+			try {
+				if (decoder == null) {
+					decoder = api.createDecoder();
+				}
+
+				var samples = decoder.decode(opusData);
+				for (var sample : samples) {
+					pcmAudio.write(sample & 0xFF);
+					pcmAudio.write((sample >> 8) & 0xFF);
+				}
+			} catch (RuntimeException ignored) {
+				if (decoder != null) {
+					decoder.close();
+					decoder = null;
+				}
+			}
+		}
 	}
 
-	private record SpeechSegment(int packetCount, int opusByteCount, long durationMs, boolean whispering) {
+	private record SpeechSegment(
+			int packetCount,
+			int opusByteCount,
+			long durationMs,
+			boolean whispering,
+			String pcmAudioBase64
+	) {
 	}
 }

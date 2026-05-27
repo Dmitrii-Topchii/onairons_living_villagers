@@ -1,10 +1,13 @@
+import base64
 import json
 import os
 import random
 import re
+import tempfile
 import time
 import urllib.error
 import urllib.request
+import wave
 from collections import defaultdict, deque
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,9 +27,13 @@ MAX_NEW_TOKENS = int(os.getenv("LV_MAX_NEW_TOKENS", "180"))
 TEMPERATURE = float(os.getenv("LV_TEMPERATURE", "0.75"))
 TOP_P = float(os.getenv("LV_TOP_P", "0.9"))
 DATASET_PATH = Path(os.getenv("LV_DATASET_PATH", "data/interactions_raw.jsonl"))
+STT_BACKEND = os.getenv("LV_STT_BACKEND", "none").lower()
+STT_MODEL_ID = os.getenv("LV_STT_MODEL_ID", "base.en")
+STT_LANGUAGE = os.getenv("LV_STT_LANGUAGE", "en")
 
 recent_memories: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=5))
 transformers_runtime: dict[str, Any] = {}
+stt_runtime: dict[str, Any] = {}
 
 
 class VillagerRespondResponse(BaseModel):
@@ -42,6 +49,8 @@ def health() -> dict[str, str]:
         "status": "ok",
         "backend": BACKEND,
         "model": MODEL_ID,
+        "stt_backend": STT_BACKEND,
+        "stt_model": STT_MODEL_ID,
     }
 
 
@@ -49,6 +58,7 @@ def health() -> dict[str, str]:
 async def villager_respond(request: Request) -> VillagerRespondResponse:
     started_at = time.perf_counter()
     payload = await request.json()
+    payload, stt_error = transcribe_payload_if_configured(payload)
     player = payload.get("player", {})
     villager = payload.get("villager", {})
     player_uuid = player.get("uuid", "unknown_player")
@@ -69,12 +79,12 @@ async def villager_respond(request: Request) -> VillagerRespondResponse:
             model_text = ""
             response = mock_response(payload, memory_before)
         ok = True
-        error = None
+        error = stt_error
     except Exception as exc:
         model_text = ""
         response = fallback_response(payload)
         ok = False
-        error = repr(exc)
+        error = combine_errors(stt_error, repr(exc))
 
     recent_memories[memory_key].append(response.memory_update)
     latency_ms = int((time.perf_counter() - started_at) * 1000)
@@ -84,6 +94,7 @@ async def villager_respond(request: Request) -> VillagerRespondResponse:
 
 def build_prompt(payload: dict[str, Any], memory: list[str]) -> list[dict[str, str]]:
     transcript = payload.get("transcript", "mock transcript")
+    transcript_source = payload.get("transcript_source", "minecraft_voice_packet")
     player = payload.get("player", {})
     villager = payload.get("villager", {})
     scene = payload.get("scene", [])
@@ -94,6 +105,8 @@ def build_prompt(payload: dict[str, Any], memory: list[str]) -> list[dict[str, s
         "You are not a helpful assistant and you must not explain the task. "
         "React like a short, funny, annoyed, slightly unhinged Minecraft villager. "
         "Use the scene facts and recent memory. Be specific, not generic. "
+        "If the transcript is unavailable, react to the sound and scene without pretending "
+        "you understood exact words. Never mention internal Java/debug strings. "
         "The line must be one short sentence. Mild profanity is allowed sometimes, "
         "but no slurs, hate, real-world politics, or protected-group insults. "
         "Return strict JSON only with keys: line, emotion, action, memory_update."
@@ -101,6 +114,7 @@ def build_prompt(payload: dict[str, Any], memory: list[str]) -> list[dict[str, s
 
     user = {
         "player_speech_transcript": transcript,
+        "transcript_source": transcript_source,
         "audio_duration_ms": audio_duration_ms,
         "player": player,
         "villager": villager,
@@ -126,6 +140,75 @@ def build_prompt(payload: dict[str, Any], memory: list[str]) -> list[dict[str, s
         {"role": "system", "content": system},
         {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
     ]
+
+
+def transcribe_payload_if_configured(payload: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+    if STT_BACKEND == "none":
+        payload.setdefault("transcript_source", "mock")
+        return payload, None
+
+    transcript = str(payload.get("transcript", "")).strip()
+    if transcript and transcript != "mock transcript":
+        payload["transcript_source"] = payload.get("transcript_source", "provided")
+        return payload, None
+
+    audio_base64 = payload.get("audio_pcm_s16le_base64", "")
+    if not audio_base64:
+        payload["transcript"] = "inaudible speech"
+        payload["transcript_source"] = "missing_audio"
+        return payload, "STT was enabled, but request had no PCM audio"
+
+    try:
+        if STT_BACKEND == "faster_whisper":
+            transcript = transcribe_with_faster_whisper(payload, audio_base64)
+        else:
+            payload.setdefault("transcript_source", "mock")
+            return payload, f"Unknown LV_STT_BACKEND={STT_BACKEND!r}"
+    except Exception as exc:
+        payload.setdefault("transcript_source", "mock")
+        return payload, f"STT failed: {exc!r}"
+
+    payload["transcript"] = transcript or "inaudible speech"
+    payload["transcript_source"] = STT_BACKEND
+    return payload, None
+
+
+def transcribe_with_faster_whisper(payload: dict[str, Any], audio_base64: str) -> str:
+    if "model" not in stt_runtime:
+        from faster_whisper import WhisperModel
+
+        stt_runtime["model"] = WhisperModel(
+            STT_MODEL_ID,
+            device=os.getenv("LV_STT_DEVICE", "auto"),
+            compute_type=os.getenv("LV_STT_COMPUTE_TYPE", "default"),
+        )
+
+    pcm = base64.b64decode(audio_base64)
+    sample_rate = int(payload.get("audio_sample_rate_hz", 48000) or 48000)
+    channels = int(payload.get("audio_channels", 1) or 1)
+    wav_path = None
+
+    try:
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+            wav_path = Path(temp_file.name)
+
+        with wave.open(str(wav_path), "wb") as wav_file:
+            wav_file.setnchannels(channels)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(pcm)
+
+        model = stt_runtime["model"]
+        segments, _info = model.transcribe(
+            str(wav_path),
+            language=STT_LANGUAGE or None,
+            vad_filter=True,
+            beam_size=1,
+        )
+        return " ".join(segment.text.strip() for segment in segments).strip()
+    finally:
+        if wav_path is not None:
+            wav_path.unlink(missing_ok=True)
 
 
 def call_openai_compatible(messages: list[dict[str, str]]) -> str:
@@ -259,6 +342,13 @@ def fallback_response(payload: dict[str, Any]) -> VillagerRespondResponse:
     )
 
 
+def combine_errors(*errors: str | None) -> str | None:
+    clean_errors = [error for error in errors if error]
+    if not clean_errors:
+        return None
+    return " | ".join(clean_errors)
+
+
 def log_interaction(
     payload: dict[str, Any],
     memory_before: list[str],
@@ -269,19 +359,35 @@ def log_interaction(
     error: str | None,
 ) -> None:
     DATASET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    input_for_log = sanitized_payload_for_log(payload)
     row = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "backend": BACKEND,
         "model": MODEL_ID,
+        "stt_backend": STT_BACKEND,
         "latency_ms": latency_ms,
         "ok": ok,
         "error": error,
         "input": {
-            **payload,
+            **input_for_log,
             "recent_memory": memory_before,
         },
-        "output": response.model_dump(),
+        "prompt_messages": build_prompt(payload, memory_before),
+        "output": response_to_dict(response),
         "raw_model_text": raw_model_text,
     }
     with DATASET_PATH.open("a", encoding="utf-8") as file:
         file.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def sanitized_payload_for_log(payload: dict[str, Any]) -> dict[str, Any]:
+    logged = dict(payload)
+    audio_base64 = str(logged.pop("audio_pcm_s16le_base64", "") or "")
+    logged["audio_pcm_s16le_bytes"] = len(base64.b64decode(audio_base64)) if audio_base64 else 0
+    return logged
+
+
+def response_to_dict(response: VillagerRespondResponse) -> dict[str, str]:
+    if hasattr(response, "model_dump"):
+        return response.model_dump()
+    return response.dict()

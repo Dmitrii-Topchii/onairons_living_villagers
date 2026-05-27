@@ -6,6 +6,8 @@
 python -m uvicorn server:app --host 127.0.0.1 --port 8000
 ```
 
+This is the default mode. It proves the Minecraft -> Python -> Minecraft loop, logs dataset rows, and lets the villager speak through the Simple Voice Chat audio channel with the Java-side mumble voice.
+
 ## Hugging Face Transformers Mode
 
 Install the correct `torch` build for the machine first, then:
@@ -14,6 +16,14 @@ Install the correct `torch` build for the machine first, then:
 pip install -r requirements-transformers.txt
 $env:LV_AI_BACKEND="transformers"
 $env:LV_MODEL_ID="Qwen/Qwen3-4B-Instruct-2507"
+python -m uvicorn server:app --host 127.0.0.1 --port 8000
+```
+
+Linux/bash:
+
+```bash
+export LV_AI_BACKEND=transformers
+export LV_MODEL_ID=Qwen/Qwen3-4B-Instruct-2507
 python -m uvicorn server:app --host 127.0.0.1 --port 8000
 ```
 
@@ -28,11 +38,35 @@ $env:LV_MODEL_ID="Qwen/Qwen3-30B-A3B-Instruct-2507"
 python -m uvicorn server:app --host 0.0.0.0 --port 8000
 ```
 
+Linux/bash:
+
+```bash
+export LV_AI_BACKEND=openai
+export LV_OPENAI_BASE_URL=http://127.0.0.1:8001/v1
+export LV_MODEL_ID=Qwen/Qwen3-30B-A3B-Instruct-2507
+python -m uvicorn server:app --host 127.0.0.1 --port 8000
+```
+
+## Optional Speech-to-Text
+
+The Java mod now sends decoded 48 kHz mono PCM with each accepted speech segment. By default the server keeps using the mocked transcript. To enable local Whisper transcription:
+
+```bash
+pip install -r requirements-stt.txt
+export LV_STT_BACKEND=faster_whisper
+export LV_STT_MODEL_ID=base.en
+python -m uvicorn server:app --host 127.0.0.1 --port 8000
+```
+
+For a stronger model, try `small.en` or `medium.en` after the basic loop works.
+
 Every interaction is logged automatically to:
 
 ```text
 ai_server/data/interactions_raw.jsonl
 ```
+
+The log keeps transcript/context/metadata and intentionally does not store the raw base64 audio blob.
 
 ## Dataset Export
 
@@ -41,6 +75,21 @@ After playing in Minecraft, convert raw logs into supervised fine-tuning example
 ```powershell
 python export_sft_dataset.py --input data/interactions_raw.jsonl --output data/villager_sft_train.jsonl --only-ok
 ```
+
+For cleaner fine-tuning data after real STT/model inference is connected:
+
+```bash
+python export_sft_dataset.py --input data/interactions_raw.jsonl --output data/villager_sft_train.jsonl --only-ok --skip-mock --require-real-transcript --min-duration-ms 900
+```
+
+## Course Report Plots
+
+```bash
+pip install -r requirements-analysis.txt
+python plot_dataset_stats.py --input data/interactions_raw.jsonl --output-dir data/plots
+```
+
+This creates quick plots for latency, speech duration, and number of scene facts per interaction.
 
 ## Unsloth LoRA Fine-Tuning
 
