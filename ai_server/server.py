@@ -1,0 +1,287 @@
+import json
+import os
+import random
+import re
+import time
+import urllib.error
+import urllib.request
+from collections import defaultdict, deque
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+from fastapi import FastAPI, Request
+from pydantic import BaseModel
+
+
+app = FastAPI(title="Onairon Living Villagers AI")
+
+BACKEND = os.getenv("LV_AI_BACKEND", "mock").lower()
+MODEL_ID = os.getenv("LV_MODEL_ID", "Qwen/Qwen3-4B-Instruct-2507")
+OPENAI_BASE_URL = os.getenv("LV_OPENAI_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
+OPENAI_API_KEY = os.getenv("LV_OPENAI_API_KEY", "not-needed")
+MAX_NEW_TOKENS = int(os.getenv("LV_MAX_NEW_TOKENS", "180"))
+TEMPERATURE = float(os.getenv("LV_TEMPERATURE", "0.75"))
+TOP_P = float(os.getenv("LV_TOP_P", "0.9"))
+DATASET_PATH = Path(os.getenv("LV_DATASET_PATH", "data/interactions_raw.jsonl"))
+
+recent_memories: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=5))
+transformers_runtime: dict[str, Any] = {}
+
+
+class VillagerRespondResponse(BaseModel):
+    line: str
+    emotion: str
+    action: str
+    memory_update: str
+
+
+@app.get("/health")
+def health() -> dict[str, str]:
+    return {
+        "status": "ok",
+        "backend": BACKEND,
+        "model": MODEL_ID,
+    }
+
+
+@app.post("/villager/respond")
+async def villager_respond(request: Request) -> VillagerRespondResponse:
+    started_at = time.perf_counter()
+    payload = await request.json()
+    player = payload.get("player", {})
+    villager = payload.get("villager", {})
+    player_uuid = player.get("uuid", "unknown_player")
+    villager_uuid = villager.get("uuid", "unknown_villager")
+    memory_key = f"{player_uuid}:{villager_uuid}"
+    memory_before = list(recent_memories[memory_key])
+
+    prompt = build_prompt(payload, memory_before)
+
+    try:
+        if BACKEND == "openai":
+            model_text = call_openai_compatible(prompt)
+            response = parse_model_response(model_text)
+        elif BACKEND == "transformers":
+            model_text = call_transformers(prompt)
+            response = parse_model_response(model_text)
+        else:
+            model_text = ""
+            response = mock_response(payload, memory_before)
+        ok = True
+        error = None
+    except Exception as exc:
+        model_text = ""
+        response = fallback_response(payload)
+        ok = False
+        error = repr(exc)
+
+    recent_memories[memory_key].append(response.memory_update)
+    latency_ms = int((time.perf_counter() - started_at) * 1000)
+    log_interaction(payload, memory_before, response, model_text, latency_ms, ok, error)
+    return response
+
+
+def build_prompt(payload: dict[str, Any], memory: list[str]) -> list[dict[str, str]]:
+    transcript = payload.get("transcript", "mock transcript")
+    player = payload.get("player", {})
+    villager = payload.get("villager", {})
+    scene = payload.get("scene", [])
+    audio_duration_ms = payload.get("audio_duration_ms", 0)
+
+    system = (
+        "You are the brain of a Minecraft villager NPC. "
+        "You are not a helpful assistant and you must not explain the task. "
+        "React like a short, funny, annoyed, slightly unhinged Minecraft villager. "
+        "Use the scene facts and recent memory. Be specific, not generic. "
+        "The line must be one short sentence. Mild profanity is allowed sometimes, "
+        "but no slurs, hate, real-world politics, or protected-group insults. "
+        "Return strict JSON only with keys: line, emotion, action, memory_update."
+    )
+
+    user = {
+        "player_speech_transcript": transcript,
+        "audio_duration_ms": audio_duration_ms,
+        "player": player,
+        "villager": villager,
+        "scene": scene,
+        "recent_memory": memory,
+        "allowed_actions": [
+            "stare_at_player",
+            "step_back",
+            "look_at_nearby_block",
+            "mutter",
+            "panic",
+            "ignore",
+        ],
+        "response_contract": {
+            "line": "one funny in-character sentence",
+            "emotion": "annoyed|suspicious|scared|confused|smug|offended",
+            "action": "one allowed action",
+            "memory_update": "one concise fact to remember",
+        },
+    }
+
+    return [
+        {"role": "system", "content": system},
+        {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
+    ]
+
+
+def call_openai_compatible(messages: list[dict[str, str]]) -> str:
+    body = {
+        "model": MODEL_ID,
+        "messages": messages,
+        "temperature": TEMPERATURE,
+        "top_p": TOP_P,
+        "max_tokens": MAX_NEW_TOKENS,
+    }
+    data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        f"{OPENAI_BASE_URL}/chat/completions",
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI-compatible backend returned {exc.code}: {detail}") from exc
+
+    return payload["choices"][0]["message"]["content"]
+
+
+def call_transformers(messages: list[dict[str, str]]) -> str:
+    if not transformers_runtime:
+        from transformers import AutoModelForCausalLM, AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_ID, trust_remote_code=True)
+        model = AutoModelForCausalLM.from_pretrained(
+            MODEL_ID,
+            torch_dtype="auto",
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        transformers_runtime["tokenizer"] = tokenizer
+        transformers_runtime["model"] = model
+
+    tokenizer = transformers_runtime["tokenizer"]
+    model = transformers_runtime["model"]
+    try:
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+            enable_thinking=False,
+        )
+    except TypeError:
+        text = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+    model_inputs = tokenizer([text], return_tensors="pt").to(model.device)
+    output_ids = model.generate(
+        **model_inputs,
+        max_new_tokens=MAX_NEW_TOKENS,
+        do_sample=True,
+        temperature=TEMPERATURE,
+        top_p=TOP_P,
+    )
+    generated_ids = output_ids[0][len(model_inputs.input_ids[0]):]
+    return tokenizer.decode(generated_ids, skip_special_tokens=True)
+
+
+def parse_model_response(text: str) -> VillagerRespondResponse:
+    raw = text.strip()
+    match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
+    if match:
+        raw = match.group(0)
+
+    data = json.loads(raw)
+    line = str(data.get("line", "...")).strip()
+    emotion = str(data.get("emotion", "annoyed")).strip()
+    action = str(data.get("action", "stare_at_player")).strip()
+    memory_update = str(data.get("memory_update", line)).strip()
+
+    if not line:
+        line = "I heard something, and I resent the experience."
+    if len(line) > 180:
+        line = line[:177].rstrip() + "..."
+
+    return VillagerRespondResponse(
+        line=line,
+        emotion=emotion or "annoyed",
+        action=action or "stare_at_player",
+        memory_update=memory_update or line,
+    )
+
+
+def mock_response(payload: dict[str, Any], memory: list[str]) -> VillagerRespondResponse:
+    villager = payload.get("villager", {})
+    scene = payload.get("scene", [])
+    duration_ms = payload.get("audio_duration_ms", 0)
+    profession = str(villager.get("profession", "villager"))
+    distance = float(villager.get("distance", 0) or 0)
+    environment_hint = scene[-1] if scene else "nothing useful nearby"
+    lines = [
+        f"I am a {profession}, not a public complaint box.",
+        f"You are {distance:.1f} blocks away and still somehow too close.",
+        f"I noticed {environment_hint.lower()} and, tragically, also noticed you.",
+        "Wonderful. The boots have learned language again.",
+        "You came all this way to mumble at me? Bold little disaster.",
+    ]
+    if memory:
+        lines.append("You again? I remember the previous nonsense. Unfortunately.")
+
+    line = random.choice(lines)
+    return VillagerRespondResponse(
+        line=line,
+        emotion="annoyed",
+        action="stare_at_player",
+        memory_update=f"Player spoke nearby for {duration_ms} ms near a {profession}.",
+    )
+
+
+def fallback_response(payload: dict[str, Any]) -> VillagerRespondResponse:
+    duration_ms = payload.get("audio_duration_ms", 0)
+    return VillagerRespondResponse(
+        line="My brain server coughed, but I am choosing to blame you.",
+        emotion="annoyed",
+        action="stare_at_player",
+        memory_update=f"AI backend failed after player speech of {duration_ms} ms.",
+    )
+
+
+def log_interaction(
+    payload: dict[str, Any],
+    memory_before: list[str],
+    response: VillagerRespondResponse,
+    raw_model_text: str,
+    latency_ms: int,
+    ok: bool,
+    error: str | None,
+) -> None:
+    DATASET_PATH.parent.mkdir(parents=True, exist_ok=True)
+    row = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "backend": BACKEND,
+        "model": MODEL_ID,
+        "latency_ms": latency_ms,
+        "ok": ok,
+        "error": error,
+        "input": {
+            **payload,
+            "recent_memory": memory_before,
+        },
+        "output": response.model_dump(),
+        "raw_model_text": raw_model_text,
+    }
+    with DATASET_PATH.open("a", encoding="utf-8") as file:
+        file.write(json.dumps(row, ensure_ascii=False) + "\n")

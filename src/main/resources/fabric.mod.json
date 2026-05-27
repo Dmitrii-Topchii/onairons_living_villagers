@@ -1,0 +1,43 @@
+{
+	"schemaVersion": 1,
+	"id": "onairons-living-villagers",
+	"version": "${version}",
+	"name": "Onairon's Living Villagers",
+	"description": "This is an example description! Tell everyone what your mod is about!",
+	"authors": [
+		"Onairon"
+	],
+	"contact": {
+		"homepage": "https://fabricmc.net/",
+		"sources": "https://github.com/FabricMC/fabric-example-mod"
+	},
+	"license": "CC0-1.0",
+	"icon": "assets/onairons-living-villagers/icon.png",
+	"environment": "*",
+	"entrypoints": {
+		"main": [
+			"com.onairon.livingvillagers.OnaironsLivingVillagers"
+		],
+		"client": [
+			"com.onairon.livingvillagers.client.OnaironsLivingVillagersClient"
+		],
+		"voicechat": [
+		"com.onairon.livingvillagers.voice.LivingVillagersVoicePlugin"
+		]
+	},
+	"mixins": [
+		"onairons-living-villagers.mixins.json",
+		{
+			"config": "onairons-living-villagers.client.mixins.json",
+			"environment": "client"
+		}
+	],
+	"depends": {
+		"fabricloader": ">=0.19.2",
+		"minecraft": "~1.21.11",
+		"java": ">=21",
+		"fabric-api": "*",
+		"voicechat_api": ">=2.6.13"
+	}
+	
+}

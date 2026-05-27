@@ -1,0 +1,10 @@
+# Use this on CUDA/A100 machines for LoRA/QLoRA fine-tuning.
+# Install PyTorch for your CUDA version first, then install these.
+unsloth
+datasets
+trl
+peft
+accelerate
+transformers>=4.51.0
+safetensors
+huggingface_hub

@@ -1,0 +1,8 @@
+# Install this only on the machine that will run Hugging Face Transformers inference.
+# Install the correct torch build for your hardware separately first:
+# - A100/CUDA: follow https://pytorch.org/get-started/locally/
+# - Huawei Ascend/NPU: use your site's CANN/torch-npu installation instructions.
+transformers>=4.51.0
+accelerate
+safetensors
+huggingface_hub
