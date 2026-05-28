@@ -123,7 +123,7 @@ def build_prompt(payload: dict[str, Any], memory: list[str]) -> list[dict[str, s
         "Use the scene facts and recent memory. Be specific, not generic. "
         "If the transcript is unavailable, react to the sound and scene without pretending "
         "you understood exact words. Never mention internal Java/debug strings. "
-        "The line must be one short sentence. Mild profanity is allowed sometimes, "
+        "The line must be one short sentence. Profanity is allowed sometimes, "
         "but no slurs, hate, real-world politics, or protected-group insults. "
         "Return strict JSON only with keys: line, emotion, action, memory_update. "
         "Do not wrap the JSON in markdown."
