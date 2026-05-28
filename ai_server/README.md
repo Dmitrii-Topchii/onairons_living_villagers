@@ -70,6 +70,20 @@ The log keeps transcript/context/metadata and intentionally does not store the r
 
 ## Dataset Export
 
+For clean data gathering, use one session folder per Minecraft playtest:
+
+```powershell
+.\run_dataset_session.ps1
+```
+
+After stopping the server, finalize that session:
+
+```powershell
+.\finalize_dataset_session.ps1 -SessionId 20260527T192300Z
+```
+
+See `DATASET_GATHERING.md` for the practical collection protocol.
+
 After playing in Minecraft, convert raw logs into supervised fine-tuning examples:
 
 ```powershell

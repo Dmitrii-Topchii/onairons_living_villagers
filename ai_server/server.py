@@ -1,9 +1,11 @@
+import asyncio
 import base64
 import json
 import os
 import random
 import re
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -23,17 +25,22 @@ BACKEND = os.getenv("LV_AI_BACKEND", "mock").lower()
 MODEL_ID = os.getenv("LV_MODEL_ID", "Qwen/Qwen3-4B-Instruct-2507")
 OPENAI_BASE_URL = os.getenv("LV_OPENAI_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 OPENAI_API_KEY = os.getenv("LV_OPENAI_API_KEY", "not-needed")
-MAX_NEW_TOKENS = int(os.getenv("LV_MAX_NEW_TOKENS", "180"))
+MAX_NEW_TOKENS = int(os.getenv("LV_MAX_NEW_TOKENS", "80"))
 TEMPERATURE = float(os.getenv("LV_TEMPERATURE", "0.75"))
 TOP_P = float(os.getenv("LV_TOP_P", "0.9"))
 DATASET_PATH = Path(os.getenv("LV_DATASET_PATH", "data/interactions_raw.jsonl"))
+SESSION_ID = os.getenv("LV_SESSION_ID", datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ"))
+SESSION_NOTES = os.getenv("LV_SESSION_NOTES", "")
 STT_BACKEND = os.getenv("LV_STT_BACKEND", "none").lower()
 STT_MODEL_ID = os.getenv("LV_STT_MODEL_ID", "base.en")
 STT_LANGUAGE = os.getenv("LV_STT_LANGUAGE", "en")
+STT_TIMEOUT_SECONDS = float(os.getenv("LV_STT_TIMEOUT_SECONDS", "3.0"))
+STT_PRELOAD = os.getenv("LV_STT_PRELOAD", "false").lower() in {"1", "true", "yes", "on"}
 
 recent_memories: dict[str, deque[str]] = defaultdict(lambda: deque(maxlen=5))
 transformers_runtime: dict[str, Any] = {}
 stt_runtime: dict[str, Any] = {}
+stt_lock = threading.Lock()
 
 
 class VillagerRespondResponse(BaseModel):
@@ -41,6 +48,12 @@ class VillagerRespondResponse(BaseModel):
     emotion: str
     action: str
     memory_update: str
+
+
+@app.on_event("startup")
+def preload_stt_if_configured() -> None:
+    if STT_BACKEND == "faster_whisper" and STT_PRELOAD:
+        ensure_faster_whisper_model()
 
 
 @app.get("/health")
@@ -51,6 +64,9 @@ def health() -> dict[str, str]:
         "model": MODEL_ID,
         "stt_backend": STT_BACKEND,
         "stt_model": STT_MODEL_ID,
+        "stt_timeout_seconds": str(STT_TIMEOUT_SECONDS),
+        "session_id": SESSION_ID,
+        "dataset_path": str(DATASET_PATH),
     }
 
 
@@ -58,7 +74,7 @@ def health() -> dict[str, str]:
 async def villager_respond(request: Request) -> VillagerRespondResponse:
     started_at = time.perf_counter()
     payload = await request.json()
-    payload, stt_error = transcribe_payload_if_configured(payload)
+    payload, stt_error = await transcribe_payload_if_configured(payload)
     player = payload.get("player", {})
     villager = payload.get("villager", {})
     player_uuid = player.get("uuid", "unknown_player")
@@ -71,10 +87,10 @@ async def villager_respond(request: Request) -> VillagerRespondResponse:
     try:
         if BACKEND == "openai":
             model_text = call_openai_compatible(prompt)
-            response = parse_model_response(model_text)
+            response = parse_model_response(model_text, payload, memory_before)
         elif BACKEND == "transformers":
             model_text = call_transformers(prompt)
-            response = parse_model_response(model_text)
+            response = parse_model_response(model_text, payload, memory_before)
         else:
             model_text = ""
             response = mock_response(payload, memory_before)
@@ -109,7 +125,8 @@ def build_prompt(payload: dict[str, Any], memory: list[str]) -> list[dict[str, s
         "you understood exact words. Never mention internal Java/debug strings. "
         "The line must be one short sentence. Mild profanity is allowed sometimes, "
         "but no slurs, hate, real-world politics, or protected-group insults. "
-        "Return strict JSON only with keys: line, emotion, action, memory_update."
+        "Return strict JSON only with keys: line, emotion, action, memory_update. "
+        "Do not wrap the JSON in markdown."
     )
 
     user = {
@@ -142,7 +159,7 @@ def build_prompt(payload: dict[str, Any], memory: list[str]) -> list[dict[str, s
     ]
 
 
-def transcribe_payload_if_configured(payload: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
+async def transcribe_payload_if_configured(payload: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
     if STT_BACKEND == "none":
         payload.setdefault("transcript_source", "mock")
         return payload, None
@@ -160,12 +177,20 @@ def transcribe_payload_if_configured(payload: dict[str, Any]) -> tuple[dict[str,
 
     try:
         if STT_BACKEND == "faster_whisper":
-            transcript = transcribe_with_faster_whisper(payload, audio_base64)
+            transcript = await asyncio.wait_for(
+                asyncio.to_thread(transcribe_with_faster_whisper, payload, audio_base64),
+                timeout=STT_TIMEOUT_SECONDS,
+            )
         else:
             payload.setdefault("transcript_source", "mock")
             return payload, f"Unknown LV_STT_BACKEND={STT_BACKEND!r}"
+    except asyncio.TimeoutError:
+        payload["transcript"] = "inaudible speech"
+        payload["transcript_source"] = "stt_timeout"
+        return payload, f"STT timed out after {STT_TIMEOUT_SECONDS:.1f}s"
     except Exception as exc:
-        payload.setdefault("transcript_source", "mock")
+        payload["transcript"] = "inaudible speech"
+        payload["transcript_source"] = "stt_error"
         return payload, f"STT failed: {exc!r}"
 
     payload["transcript"] = transcript or "inaudible speech"
@@ -174,41 +199,57 @@ def transcribe_payload_if_configured(payload: dict[str, Any]) -> tuple[dict[str,
 
 
 def transcribe_with_faster_whisper(payload: dict[str, Any], audio_base64: str) -> str:
+    if not stt_lock.acquire(blocking=False):
+        raise RuntimeError("STT worker is still busy")
+
+    try:
+        model = ensure_faster_whisper_model()
+        pcm = base64.b64decode(audio_base64)
+        sample_rate = int(payload.get("audio_sample_rate_hz", 48000) or 48000)
+        channels = int(payload.get("audio_channels", 1) or 1)
+        wav_path = None
+
+        try:
+            with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
+                wav_path = Path(temp_file.name)
+
+            with wave.open(str(wav_path), "wb") as wav_file:
+                wav_file.setnchannels(channels)
+                wav_file.setsampwidth(2)
+                wav_file.setframerate(sample_rate)
+                wav_file.writeframes(pcm)
+
+            segments, _info = model.transcribe(
+                str(wav_path),
+                language=STT_LANGUAGE or None,
+                vad_filter=True,
+                beam_size=1,
+            )
+            return " ".join(segment.text.strip() for segment in segments).strip()
+        finally:
+            if wav_path is not None:
+                wav_path.unlink(missing_ok=True)
+    finally:
+        stt_lock.release()
+
+
+def ensure_faster_whisper_model() -> Any:
     if "model" not in stt_runtime:
         from faster_whisper import WhisperModel
 
+        started_at = time.perf_counter()
         stt_runtime["model"] = WhisperModel(
             STT_MODEL_ID,
             device=os.getenv("LV_STT_DEVICE", "auto"),
             compute_type=os.getenv("LV_STT_COMPUTE_TYPE", "default"),
         )
-
-    pcm = base64.b64decode(audio_base64)
-    sample_rate = int(payload.get("audio_sample_rate_hz", 48000) or 48000)
-    channels = int(payload.get("audio_channels", 1) or 1)
-    wav_path = None
-
-    try:
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as temp_file:
-            wav_path = Path(temp_file.name)
-
-        with wave.open(str(wav_path), "wb") as wav_file:
-            wav_file.setnchannels(channels)
-            wav_file.setsampwidth(2)
-            wav_file.setframerate(sample_rate)
-            wav_file.writeframes(pcm)
-
-        model = stt_runtime["model"]
-        segments, _info = model.transcribe(
-            str(wav_path),
-            language=STT_LANGUAGE or None,
-            vad_filter=True,
-            beam_size=1,
+        latency_ms = int((time.perf_counter() - started_at) * 1000)
+        print(
+            f"[living-villagers] stt_model_loaded model={STT_MODEL_ID!r} "
+            f"latency={latency_ms}ms",
+            flush=True,
         )
-        return " ".join(segment.text.strip() for segment in segments).strip()
-    finally:
-        if wav_path is not None:
-            wav_path.unlink(missing_ok=True)
+    return stt_runtime["model"]
 
 
 def call_openai_compatible(messages: list[dict[str, str]]) -> str:
@@ -281,18 +322,71 @@ def call_transformers(messages: list[dict[str, str]]) -> str:
     return tokenizer.decode(generated_ids, skip_special_tokens=True)
 
 
-def parse_model_response(text: str) -> VillagerRespondResponse:
+def parse_model_response(
+    text: str,
+    payload: dict[str, Any] | None = None,
+    memory: list[str] | None = None,
+) -> VillagerRespondResponse:
     raw = text.strip()
+    if not raw:
+        if payload is not None:
+            return mock_response(payload, memory or [])
+        return make_response(
+            line="I heard something, and I resent the experience.",
+            emotion="annoyed",
+            action="stare_at_player",
+            memory_update="Player spoke nearby.",
+        )
+
     match = re.search(r"\{.*\}", raw, flags=re.DOTALL)
     if match:
-        raw = match.group(0)
+        try:
+            data = json.loads(match.group(0))
+            return response_from_dict(data)
+        except json.JSONDecodeError:
+            pass
 
-    data = json.loads(raw)
+    return response_from_text(raw)
+
+
+def response_from_dict(data: dict[str, Any]) -> VillagerRespondResponse:
     line = str(data.get("line", "...")).strip()
     emotion = str(data.get("emotion", "annoyed")).strip()
     action = str(data.get("action", "stare_at_player")).strip()
     memory_update = str(data.get("memory_update", line)).strip()
 
+    return make_response(line, emotion, action, memory_update)
+
+
+def response_from_text(raw: str) -> VillagerRespondResponse:
+    line = raw.strip()
+    line = re.sub(r"^```(?:json)?", "", line, flags=re.IGNORECASE).strip()
+    line = re.sub(r"```$", "", line).strip()
+    line = line.replace("\n", " ").strip()
+
+    line_match = re.search(r'"line"\s*:\s*"([^"]+)', line)
+    if line_match:
+        line = line_match.group(1).strip()
+
+    if ":" in line and line.lower().split(":", 1)[0] in {"line", "villager", "response"}:
+        line = line.split(":", 1)[1].strip()
+
+    if line.lower().startswith("mock speech transcript"):
+        line = "You made a noise. I am trying very hard not to respect it."
+
+    sentence_match = re.search(r"(.+?[.!?])(?:\s|$)", line)
+    if sentence_match:
+        line = sentence_match.group(1).strip()
+
+    return make_response(
+        line=line,
+        emotion="annoyed",
+        action="stare_at_player",
+        memory_update=line or "Player spoke nearby.",
+    )
+
+
+def make_response(line: str, emotion: str, action: str, memory_update: str) -> VillagerRespondResponse:
     if not line:
         line = "I heard something, and I resent the experience."
     if len(line) > 180:
@@ -365,6 +459,8 @@ def log_interaction(
         "backend": BACKEND,
         "model": MODEL_ID,
         "stt_backend": STT_BACKEND,
+        "session_id": SESSION_ID,
+        "session_notes": SESSION_NOTES,
         "latency_ms": latency_ms,
         "ok": ok,
         "error": error,
@@ -378,6 +474,14 @@ def log_interaction(
     }
     with DATASET_PATH.open("a", encoding="utf-8") as file:
         file.write(json.dumps(row, ensure_ascii=False) + "\n")
+    status = "ok" if ok else "error"
+    print(
+        f"[living-villagers] {status} latency={latency_ms}ms "
+        f"transcript_source={payload.get('transcript_source')!r} "
+        f"transcript={payload.get('transcript')!r} "
+        f"line={response.line!r} error={error!r}",
+        flush=True,
+    )
 
 
 def sanitized_payload_for_log(payload: dict[str, Any]) -> dict[str, Any]:
