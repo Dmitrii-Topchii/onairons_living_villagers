@@ -1,5 +1,17 @@
 # Onairon's Living Villagers
 
+<p align="center">
+  <img alt="Minecraft 1.21.11" src="https://img.shields.io/badge/Minecraft-1.21.11-62B47A?style=for-the-badge">
+  <img alt="Fabric mod" src="https://img.shields.io/badge/Fabric-Mod-DBD0B4?style=for-the-badge">
+  <img alt="Java 21" src="https://img.shields.io/badge/Java-21-E76F00?style=for-the-badge">
+  <img alt="Python 3.11" src="https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white">
+  <img alt="FastAPI AI server" src="https://img.shields.io/badge/FastAPI-AI_Server-009688?style=for-the-badge&logo=fastapi&logoColor=white">
+  <img alt="Faster Whisper STT" src="https://img.shields.io/badge/Faster--Whisper-STT-2563EB?style=for-the-badge">
+  <img alt="Qwen3 LoRA" src="https://img.shields.io/badge/Qwen3-4B_LoRA-7C3AED?style=for-the-badge">
+  <img alt="LM Studio" src="https://img.shields.io/badge/LM_Studio-Local_Inference-111827?style=for-the-badge">
+  <img alt="Research demo" src="https://img.shields.io/badge/Status-Research_Demo-F59E0B?style=for-the-badge">
+</p>
+
 Voice-driven, context-aware Minecraft villagers powered by Simple Voice Chat, a local FastAPI AI server, speech-to-text, and a fine-tuned Qwen villager brain.
 
 The project turns nearby villagers into reactive NPCs: the player talks through the microphone, the mod captures the voice segment, the AI server transcribes it, adds world context and recent memory, and returns a short in-character villager response.
