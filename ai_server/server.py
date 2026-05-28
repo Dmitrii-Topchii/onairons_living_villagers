@@ -25,6 +25,7 @@ BACKEND = os.getenv("LV_AI_BACKEND", "mock").lower()
 MODEL_ID = os.getenv("LV_MODEL_ID", "Qwen/Qwen3-4B-Instruct-2507")
 OPENAI_BASE_URL = os.getenv("LV_OPENAI_BASE_URL", "http://127.0.0.1:8001/v1").rstrip("/")
 OPENAI_API_KEY = os.getenv("LV_OPENAI_API_KEY", "not-needed")
+OPENAI_API_STYLE = os.getenv("LV_OPENAI_API_STYLE", "chat").lower()
 MAX_NEW_TOKENS = int(os.getenv("LV_MAX_NEW_TOKENS", "80"))
 TEMPERATURE = float(os.getenv("LV_TEMPERATURE", "0.75"))
 TOP_P = float(os.getenv("LV_TOP_P", "0.9"))
@@ -62,6 +63,7 @@ def health() -> dict[str, str]:
         "status": "ok",
         "backend": BACKEND,
         "model": MODEL_ID,
+        "openai_api_style": OPENAI_API_STYLE,
         "stt_backend": STT_BACKEND,
         "stt_model": STT_MODEL_ID,
         "stt_timeout_seconds": str(STT_TIMEOUT_SECONDS),
@@ -115,12 +117,20 @@ def build_prompt(payload: dict[str, Any], memory: list[str]) -> list[dict[str, s
     villager = payload.get("villager", {})
     scene = payload.get("scene", [])
     audio_duration_ms = payload.get("audio_duration_ms", 0)
+    distance_relevant = is_distance_relevant(transcript, villager)
+    scene_for_prompt = scene if distance_relevant else without_distance_facts(scene)
+    villager_for_prompt = dict(villager)
+    if not distance_relevant:
+        villager_for_prompt.pop("distance", None)
 
     system = (
         "You are the brain of a Minecraft villager NPC. "
         "You are not a helpful assistant and you must not explain the task. "
         "React like a short, funny, annoyed, slightly unhinged Minecraft villager. "
-        "Use the scene facts and recent memory. Be specific, not generic. "
+        "Answer the player's speech first. Use scene facts and recent memory only to enrich the reply. "
+        "Do not ignore clear topics like house, name, trade, potatoes, zombies, danger, items, or insults. "
+        "Mention distance or personal space only if the player explicitly asks about closeness/moving, "
+        "or if distance_relevant is true. Be specific, not generic. "
         "If the transcript is unavailable, react to the sound and scene without pretending "
         "you understood exact words. Never mention internal Java/debug strings. "
         "The line must be one short sentence. Profanity is allowed sometimes, "
@@ -134,9 +144,16 @@ def build_prompt(payload: dict[str, Any], memory: list[str]) -> list[dict[str, s
         "transcript_source": transcript_source,
         "audio_duration_ms": audio_duration_ms,
         "player": player,
-        "villager": villager,
-        "scene": scene,
+        "villager": villager_for_prompt,
+        "scene": scene_for_prompt,
         "recent_memory": memory,
+        "distance_relevant": distance_relevant,
+        "response_priority": [
+            "Answer player_speech_transcript directly first.",
+            "Use scene facts only if they are relevant to the transcript.",
+            "Do not mention distance, closeness, elbows, pushing, or personal space unless distance_relevant is true.",
+            "Avoid repeating the same complaint from recent_memory.",
+        ],
         "allowed_actions": [
             "stare_at_player",
             "step_back",
@@ -157,6 +174,40 @@ def build_prompt(payload: dict[str, Any], memory: list[str]) -> list[dict[str, s
         {"role": "system", "content": system},
         {"role": "user", "content": json.dumps(user, ensure_ascii=False)},
     ]
+
+
+def is_distance_relevant(transcript: str, villager: dict[str, Any]) -> bool:
+    text = str(transcript or "").lower()
+    distance = villager.get("distance")
+    try:
+        if distance is not None and float(distance) <= 0.65:
+            return True
+    except (TypeError, ValueError):
+        pass
+
+    distance_words = [
+        "close",
+        "near",
+        "space",
+        "move",
+        "back up",
+        "step back",
+        "push",
+        "shove",
+        "behind you",
+        "too close",
+    ]
+    return any(word in text for word in distance_words)
+
+
+def without_distance_facts(scene: list[Any]) -> list[Any]:
+    filtered = []
+    for fact in scene:
+        text = str(fact)
+        if re.search(r"\bnearest villager is\b.+\bblocks away\b", text, flags=re.IGNORECASE):
+            continue
+        filtered.append(fact)
+    return filtered
 
 
 async def transcribe_payload_if_configured(payload: dict[str, Any]) -> tuple[dict[str, Any], str | None]:
@@ -253,12 +304,20 @@ def ensure_faster_whisper_model() -> Any:
 
 
 def call_openai_compatible(messages: list[dict[str, str]]) -> str:
+    if OPENAI_API_STYLE in {"completion", "completions", "plain"}:
+        return call_openai_completion(messages)
+    return call_openai_chat(messages)
+
+
+def call_openai_chat(messages: list[dict[str, str]]) -> str:
     body = {
         "model": MODEL_ID,
         "messages": messages,
         "temperature": TEMPERATURE,
         "top_p": TOP_P,
         "max_tokens": MAX_NEW_TOKENS,
+        "tool_choice": "none",
+        "response_format": {"type": "json_object"},
     }
     data = json.dumps(body).encode("utf-8")
     request = urllib.request.Request(
@@ -278,6 +337,55 @@ def call_openai_compatible(messages: list[dict[str, str]]) -> str:
         raise RuntimeError(f"OpenAI-compatible backend returned {exc.code}: {detail}") from exc
 
     return payload["choices"][0]["message"]["content"]
+
+
+def call_openai_completion(messages: list[dict[str, str]]) -> str:
+    body = {
+        "model": MODEL_ID,
+        "prompt": messages_to_plain_prompt(messages),
+        "temperature": TEMPERATURE,
+        "top_p": TOP_P,
+        "max_tokens": MAX_NEW_TOKENS,
+        "stop": ["\nUSER:", "\nSYSTEM:", "\nASSISTANT:", "<|im_end|>"],
+    }
+    data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        f"{OPENAI_BASE_URL}/completions",
+        data=data,
+        method="POST",
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {OPENAI_API_KEY}",
+        },
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"OpenAI-compatible completion backend returned {exc.code}: {detail}") from exc
+
+    choice = payload["choices"][0]
+    return choice.get("text") or choice.get("message", {}).get("content", "")
+
+
+def messages_to_plain_prompt(messages: list[dict[str, str]]) -> str:
+    system = next((message["content"] for message in messages if message.get("role") == "system"), "")
+    user = next((message["content"] for message in messages if message.get("role") == "user"), "")
+    return "\n".join([
+        "SYSTEM:",
+        system,
+        "",
+        "Hard output rules:",
+        "- Output exactly one JSON object and nothing else.",
+        "- Never output markdown, XML, <tool_call>, tool calls, or explanations.",
+        "- The JSON keys must be: line, emotion, action, memory_update.",
+        "",
+        "USER_CONTEXT_JSON:",
+        user,
+        "",
+        "ASSISTANT_JSON:",
+    ])
 
 
 def call_transformers(messages: list[dict[str, str]]) -> str:
@@ -327,7 +435,7 @@ def parse_model_response(
     payload: dict[str, Any] | None = None,
     memory: list[str] | None = None,
 ) -> VillagerRespondResponse:
-    raw = text.strip()
+    raw = clean_model_text(text)
     if not raw:
         if payload is not None:
             return mock_response(payload, memory or [])
@@ -350,16 +458,16 @@ def parse_model_response(
 
 
 def response_from_dict(data: dict[str, Any]) -> VillagerRespondResponse:
-    line = str(data.get("line", "...")).strip()
-    emotion = str(data.get("emotion", "annoyed")).strip()
-    action = str(data.get("action", "stare_at_player")).strip()
-    memory_update = str(data.get("memory_update", line)).strip()
+    line = clean_model_text(str(data.get("line", "...")))
+    emotion = clean_model_text(str(data.get("emotion", "annoyed")))
+    action = clean_model_text(str(data.get("action", "stare_at_player")))
+    memory_update = clean_model_text(str(data.get("memory_update", line)))
 
     return make_response(line, emotion, action, memory_update)
 
 
 def response_from_text(raw: str) -> VillagerRespondResponse:
-    line = raw.strip()
+    line = clean_model_text(raw)
     line = re.sub(r"^```(?:json)?", "", line, flags=re.IGNORECASE).strip()
     line = re.sub(r"```$", "", line).strip()
     line = line.replace("\n", " ").strip()
@@ -386,7 +494,20 @@ def response_from_text(raw: str) -> VillagerRespondResponse:
     )
 
 
+def clean_model_text(text: str) -> str:
+    cleaned = str(text or "").strip()
+    cleaned = re.sub(r"</?tool_call>", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"<\|[^>]+?\|>", "", cleaned).strip()
+    cleaned = re.sub(r"^(?:ас|ано|ан)\s*[,!:\-]?\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    cleaned = re.sub(r"^assistant(?:_json)?\s*[:\-]\s*", "", cleaned, flags=re.IGNORECASE).strip()
+    return cleaned
+
+
 def make_response(line: str, emotion: str, action: str, memory_update: str) -> VillagerRespondResponse:
+    line = clean_model_text(line)
+    emotion = clean_model_text(emotion)
+    action = clean_model_text(action)
+    memory_update = clean_model_text(memory_update)
     if not line:
         line = "I heard something, and I resent the experience."
     if len(line) > 180:
