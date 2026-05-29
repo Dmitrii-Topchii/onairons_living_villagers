@@ -1,15 +1,15 @@
 # Onairon's Living Villagers
 
 <p align="center">
-  <img alt="Minecraft 1.21.11" src="https://img.shields.io/badge/Minecraft-1.21.11-62B47A?style=for-the-badge">
-  <img alt="Fabric mod" src="https://img.shields.io/badge/Fabric-Mod-DBD0B4?style=for-the-badge">
-  <img alt="Java 21" src="https://img.shields.io/badge/Java-21-E76F00?style=for-the-badge">
-  <img alt="Python 3.11" src="https://img.shields.io/badge/Python-3.11-3776AB?style=for-the-badge&logo=python&logoColor=white">
-  <img alt="FastAPI AI server" src="https://img.shields.io/badge/FastAPI-AI_Server-009688?style=for-the-badge&logo=fastapi&logoColor=white">
-  <img alt="Faster Whisper STT" src="https://img.shields.io/badge/Faster--Whisper-STT-2563EB?style=for-the-badge">
-  <img alt="Qwen3 LoRA" src="https://img.shields.io/badge/Qwen3-4B_LoRA-7C3AED?style=for-the-badge">
-  <img alt="LM Studio" src="https://img.shields.io/badge/LM_Studio-Local_Inference-111827?style=for-the-badge">
-  <img alt="Research demo" src="https://img.shields.io/badge/Status-Research_Demo-F59E0B?style=for-the-badge">
+  <img alt="Minecraft 1.21.11" src="https://img.shields.io/badge/minecraft-1.21.11-62B47A?style=flat&labelColor=3F3F46">
+  <img alt="Fabric Loader 0.19.2" src="https://img.shields.io/badge/fabric-0.19.2-DBD0B4?style=flat&labelColor=3F3F46">
+  <img alt="Java 21" src="https://img.shields.io/badge/java-21-E76F00?style=flat&labelColor=3F3F46">
+  <img alt="Python versions" src="https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-3776AB?style=flat&labelColor=3F3F46&logo=python&logoColor=white">
+  <img alt="FastAPI server" src="https://img.shields.io/badge/server-FastAPI-009688?style=flat&labelColor=3F3F46&logo=fastapi&logoColor=white">
+  <img alt="Speech to text" src="https://img.shields.io/badge/STT-faster--whisper-2563EB?style=flat&labelColor=3F3F46">
+  <img alt="Villager brain" src="https://img.shields.io/badge/brain-Qwen3%204B%20LoRA-7C3AED?style=flat&labelColor=3F3F46">
+  <img alt="Dataset rows" src="https://img.shields.io/badge/dataset-396%20SFT%20rows-F59E0B?style=flat&labelColor=3F3F46">
+  <img alt="License CC0 1.0" src="https://img.shields.io/badge/license-CC0%201.0-4C8EDA?style=flat&labelColor=3F3F46">
 </p>
 
 Voice-driven, context-aware Minecraft villagers powered by Simple Voice Chat, a local FastAPI AI server, speech-to-text, and a fine-tuned Qwen villager brain.
